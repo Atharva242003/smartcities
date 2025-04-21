@@ -1,0 +1,265 @@
+# Colab Cell 1: Mount Google Drive & Install Dependencies
+from google.colab import drive
+drive.mount('/content/drive')
+
+!pip install opencv-python-headless tensorflow scikit-learn matplotlib
+
+# Colab Cell 2: Unzip Drowsiness Dataset
+!unzip -q "/content/drive/MyDrive/ddd.zip" -d "/content/drowsiness_data"
+
+# Colab Cell 3: Imports
+import os, glob
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from IPython.display import HTML
+
+from tensorflow.keras import Input, Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.utils import to_categorical
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, classification_report, confusion_matrix
+)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+import matplotlib.animation as animation
+
+# Colab Cell 4: CNN-based Drowsiness Detection
+# Load & preprocess images
+data_dir = '/content/drowsiness_data'
+img_size = (64, 64)
+X_imgs, y_imgs = [], []
+for label, folder in enumerate(['Non Drowsy','Drowsy']):
+    for filepath in glob.glob(os.path.join(data_dir, folder, '*.[jp][pn]g')):
+        img = load_img(filepath, target_size=img_size, color_mode='grayscale')
+        arr = img_to_array(img).astype('float32') / 255.0
+        X_imgs.append(arr)
+        y_imgs.append(label)
+
+X = np.stack(X_imgs)                 # (N,64,64,1)
+y = to_categorical(y_imgs)           # (N,2)
+
+# Train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y_imgs
+)
+
+# Build CNN
+cnn = Sequential([
+    Input(shape=(64,64,1)),
+    Conv2D(32, (3,3), activation='relu'), MaxPooling2D(2,2),
+    Conv2D(64, (3,3), activation='relu'), MaxPooling2D(2,2),
+    Flatten(), Dense(64, activation='relu'), Dropout(0.5),
+    Dense(2, activation='softmax')
+])
+cnn.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+
+# Train
+history = cnn.fit(X_train, y_train, epochs=8, batch_size=32,
+                  validation_data=(X_test, y_test))
+
+# Plot training curves
+plt.figure(figsize=(12,4))
+plt.subplot(1,2,1)
+plt.plot(history.history['accuracy'], label='train')
+plt.plot(history.history['val_accuracy'], label='val')
+plt.title('CNN Accuracy'); plt.xlabel('Epoch'); plt.legend()
+plt.subplot(1,2,2)
+plt.plot(history.history['loss'], label='train')
+plt.plot(history.history['val_loss'], label='val')
+plt.title('CNN Loss'); plt.xlabel('Epoch'); plt.legend()
+plt.show()
+
+# Evaluate CNN
+y_pred = cnn.predict(X_test).argmax(axis=1)
+y_true = y_test.argmax(axis=1)
+print("CNN Classification Report:\n", classification_report(y_true, y_pred))
+cm = confusion_matrix(y_true, y_pred)
+plt.figure(figsize=(4,4))
+plt.imshow(cm, cmap='Blues', interpolation='nearest')
+for i in range(2):
+    for j in range(2):
+        plt.text(j, i, cm[i,j], ha='center', va='center', color='white')
+plt.xticks([0,1], ['Alert','Drowsy']); plt.yticks([0,1], ['Alert','Drowsy'])
+plt.title('CNN Confusion Matrix'); plt.colorbar(); plt.show()
+
+# Colab Cell X: Reassign Clusters, Sample More Vehicles, and Animate by Behavior
+
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from google.colab import drive
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+import matplotlib.animation as animation
+from IPython.display import HTML
+
+# 1. Mount Drive and load data
+drive.mount('/content/drive')
+base_path = '/content/drive/MyDrive'
+traj_path = os.path.join(base_path, 'trajectories.txt')
+cols = ['Vehicle_ID','Frame_ID','Total_Frames','Global_Time',
+        'Local_X','Local_Y','Global_X','Global_Y',
+        'Vehicle_Length','Vehicle_Width','Vehicle_Class',
+        'Velocity','Acceleration','Lane_ID','Preceding',
+        'Following','Spacing','Headway']
+df = pd.read_csv(traj_path, delim_whitespace=True, names=cols)
+
+# 2. Extract behavior features
+feat_list = []
+for vid, grp in df.groupby('Vehicle_ID'):
+    acc = grp['Acceleration'].values
+    jerk = np.diff(acc) / 0.1
+    feat_list.append({
+        'Vehicle_ID': vid,
+        'mean_vel': grp['Velocity'].mean(),
+        'std_vel': grp['Velocity'].std(),
+        'mean_acc': grp['Acceleration'].mean(),
+        'std_acc': grp['Acceleration'].std(),
+        'lane_changes': grp['Lane_ID'].nunique(),
+        'mean_spacing': grp['Spacing'].replace(9999.99, np.nan).mean(),
+        'jerk_mean': jerk.mean() if jerk.size else 0,
+        'jerk_std': jerk.std() if jerk.size else 0
+    })
+
+veh_feats = pd.DataFrame(feat_list).dropna()
+
+# 3. Standardize and cluster
+features = ['mean_vel','std_vel','mean_acc','std_acc',
+            'lane_changes','mean_spacing','jerk_mean','jerk_std']
+X = veh_feats[features].values
+scaler = StandardScaler().fit(X)
+X_scaled = scaler.transform(X)
+
+kmeans = KMeans(n_clusters=3, random_state=42).fit(X_scaled)
+veh_feats['cluster'] = kmeans.labels_
+
+# 4. Reassign semantic behavior labels
+# Compute centroids in original feature space
+centroids = pd.DataFrame(
+    scaler.inverse_transform(kmeans.cluster_centers_),
+    columns=features,
+    index=[0,1,2]
+)
+# Sort clusters by std_acc to infer behavior
+sorted_by_std_acc = centroids['std_acc'].sort_values().index.tolist()
+behavior_map = {
+    sorted_by_std_acc[0]: 'Cautious',     # lowest variability
+    sorted_by_std_acc[1]: 'Distracted',   # middle
+    sorted_by_std_acc[2]: 'Aggressive'    # highest variability
+}
+veh_feats['behavior'] = veh_feats['cluster'].map(behavior_map)
+
+# 5. PCA and visualize clusters by behavior
+pca = PCA(n_components=2).fit(X_scaled)
+veh_feats[['pca1','pca2']] = pca.transform(X_scaled)
+
+plt.figure(figsize=(6,6))
+for beh, color in zip(['Cautious','Distracted','Aggressive'], ['green','orange','red']):
+    sub = veh_feats[veh_feats['behavior']==beh]
+    plt.scatter(sub['pca1'], sub['pca2'], label=beh, c=color, s=20)
+plt.xlabel('PC1'); plt.ylabel('PC2')
+plt.title('Behavioral Clusters (PCA)')
+plt.legend(); plt.show()
+
+# Display centroids for reference
+print("Cluster centroids (original feature units):")
+display(centroids)
+
+# 6. Sample more vehicles (e.g., 15 per behavior) for animation
+sample_ids = []
+for beh in ['Cautious','Distracted','Aggressive']:
+    ids = veh_feats[veh_feats['behavior']==beh]['Vehicle_ID']
+    sample_ids += ids.sample(15, random_state=42).tolist()
+df_anim = df[df['Vehicle_ID'].isin(sample_ids)].merge(
+    veh_feats[['Vehicle_ID','behavior']], on='Vehicle_ID'
+)
+df_anim['code'] = df_anim['behavior'].map({'Cautious':0,'Distracted':1,'Aggressive':2})
+# 3. Clustering & Behavior Mapping
+features = ['mean_vel','std_vel','mean_acc','std_acc',
+            'lane_changes','mean_spacing','jerk_mean','jerk_std']
+X = veh_feats[features].values
+scaler = StandardScaler().fit(X)
+X_scaled = scaler.transform(X)
+kmeans = KMeans(n_clusters=3, random_state=42).fit(X_scaled)
+veh_feats['cluster'] = kmeans.labels_
+
+# Compute centroids and map clusters to behaviors
+centroids = pd.DataFrame(
+    scaler.inverse_transform(kmeans.cluster_centers_),
+    columns=features, index=[0,1,2]
+)
+# Decide behavior by std_acc magnitude
+sorted_ids = centroids['std_acc'].sort_values().index.tolist()
+behavior_map = {sorted_ids[0]: 'Cautious',
+                sorted_ids[1]: 'Distracted',
+                sorted_ids[2]: 'Aggressive'}
+veh_feats['behavior'] = veh_feats['cluster'].map(behavior_map)
+
+# 4. Inspect Behavior Counts
+print("Behavior counts:")
+display(veh_feats['behavior'].value_counts())
+
+# 5. Sample Vehicles per Behavior (up to 20 each)
+sample_ids = []
+for beh in ['Cautious', 'Distracted', 'Aggressive']:
+    ids = veh_feats[veh_feats['behavior']==beh]['Vehicle_ID']
+    n = min(len(ids), 20)
+    sample_ids += ids.sample(n, random_state=42).tolist()
+print(f"Total sampled vehicles: {len(sample_ids)}")
+
+# 6. Static 2D Trajectory Plot
+colors = {'Cautious':'green','Distracted':'orange','Aggressive':'red'}
+plt.figure(figsize=(8,6))
+for vid in sample_ids:
+    traj = df[df['Vehicle_ID']==vid]
+    beh = veh_feats.loc[veh_feats['Vehicle_ID']==vid, 'behavior'].iloc[0]
+    plt.plot(traj['Local_X'], traj['Local_Y'], alpha=0.5, color=colors[beh])
+plt.xlabel('Local X (ft)'); plt.ylabel('Local Y (ft)')
+plt.title('Sample Trajectories by Behavior')
+plt.show()
+
+# 7. Animated Scatter Trajectories
+df_anim = df[df['Vehicle_ID'].isin(sample_ids)].merge(
+    veh_feats[['Vehicle_ID','behavior']], on='Vehicle_ID'
+)
+df_anim['code'] = df_anim['behavior'].map({'Cautious':0,'Distracted':1,'Aggressive':2})
+times = sorted(df_anim['Frame_ID'].unique())
+
+fig, ax = plt.subplots(figsize=(8,6))
+ax.set_xlim(df['Local_X'].min(), df['Local_X'].max())
+ax.set_ylim(df['Local_Y'].min(), df['Local_Y'].max())
+ax.set_xlabel('Local X (ft)'); ax.set_ylabel('Local Y (ft)')
+ax.set_title('Animated Trajectories by Behavior')
+
+scat = ax.scatter([], [], c=[], s=20, cmap='tab10', vmin=0, vmax=2)
+
+def init():
+    scat.set_offsets(np.empty((0,2)))
+    scat.set_array(np.array([]))
+    return scat,
+
+def update(frame):
+    t = times[frame]
+    df_t = df_anim[df_anim['Frame_ID'] == t]
+    coords = df_t[['Local_X','Local_Y']].values
+    cols = df_t['code'].values
+    scat.set_offsets(coords)
+    scat.set_array(cols)
+    return scat,
+
+ani = animation.FuncAnimation(fig, update, frames=len(times),
+                              init_func=init, interval=100, blit=True)
+HTML(ani.to_jshtml())
+
+
+
+
